@@ -11,7 +11,7 @@ import (
 	str "github.com/boyter/go-string"
 
 	"github.com/boyter/cs/v3/pkg/common"
-	"github.com/boyter/scc/v3/processor"
+	"github.com/boyter/scc/v4/processor"
 )
 
 // RankingProfile bundles BM25 parameters and post-ranking knobs into a single

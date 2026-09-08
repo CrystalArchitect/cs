@@ -44,13 +44,13 @@ github.com/aymanbagabas/go-osc52/v2
 # github.com/boyter/go-string v1.0.6-0.20260611011129-ac73d0bec139
 ## explicit; go 1.24
 github.com/boyter/go-string
-# github.com/boyter/gocodewalker v1.5.2-0.20260904094951-cef1752d387f
+# github.com/boyter/gocodewalker v1.5.2-0.20260905064325-27ad42ef7a81
 ## explicit; go 1.23.0
 github.com/boyter/gocodewalker
 github.com/boyter/gocodewalker/go-gitignore
-# github.com/boyter/scc/v3 v3.7.1-0.20260726014854-dbbf57bc7514
+# github.com/boyter/scc/v4 v4.1.0
 ## explicit; go 1.26.4
-github.com/boyter/scc/v3/processor
+github.com/boyter/scc/v4/processor
 # github.com/boyter/simplecache v0.0.0-20260310220729-445661819a53
 ## explicit; go 1.23.3
 github.com/boyter/simplecache

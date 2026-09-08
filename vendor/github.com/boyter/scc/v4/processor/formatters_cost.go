@@ -13,6 +13,7 @@ import (
 )
 
 func calculateCocomoSLOCCount(sumCode int64, str *strings.Builder) {
+	c := cocomoCoefficients()
 	estimatedEffort := EstimateEffort(int64(sumCode), EAF)
 	estimatedScheduleMonths := EstimateScheduleMonths(estimatedEffort)
 	estimatedPeopleRequired := 0.0
@@ -25,9 +26,9 @@ func calculateCocomoSLOCCount(sumCode int64, str *strings.Builder) {
 
 	_, _ = p.Fprintf(str, "Total Physical Source Lines of Code (SLOC)                     = %d\n", sumCode)
 	_, _ = p.Fprintf(str, "Development Effort Estimate, Person-Years (Person-Months)      = %.2f (%.2f)\n", estimatedEffort/12, estimatedEffort)
-	_, _ = p.Fprintf(str, " (Basic COCOMO model, Person-Months = %.2f*(KSLOC**%.2f)*%.2f)\n", projectType[CocomoProjectType][0], projectType[CocomoProjectType][1], EAF)
+	_, _ = p.Fprintf(str, " (Basic COCOMO model, Person-Months = %.2f*(KSLOC**%.2f)*%.2f)\n", c[0], c[1], EAF)
 	_, _ = p.Fprintf(str, "Schedule Estimate, Years (Months)                              = %.2f (%.2f)\n", estimatedScheduleMonths/12, estimatedScheduleMonths)
-	_, _ = p.Fprintf(str, " (Basic COCOMO model, Months = %.2f*(person-months**%.2f))\n", projectType[CocomoProjectType][2], projectType[CocomoProjectType][3])
+	_, _ = p.Fprintf(str, " (Basic COCOMO model, Months = %.2f*(person-months**%.2f))\n", c[2], c[3])
 	_, _ = p.Fprintf(str, "Estimated Average Number of Developers (Effort/Schedule)       = %.2f\n", estimatedPeopleRequired)
 	_, _ = p.Fprintf(str, "Total Estimated Cost to Develop                                = %s%.0f\n", CurrencySymbol, estimatedCost)
 	_, _ = p.Fprintf(str, " (average salary = %s%d/year, overhead = %.2f)\n", CurrencySymbol, AverageWage, Overhead)
@@ -144,9 +145,7 @@ func calculateSize(sumBytes int64, str *strings.Builder) {
 		size = float64(sumBytes) / 1_024_000
 	case "xkcd-kb":
 		str.WriteString("1000 bytes during leap years, 1024 otherwise\n")
-		if isLeapYear(time.Now().Year()) {
-			size = float64(sumBytes) / 1_000_000
-		}
+		size = float64(sumBytes) / xkcdKbDivisor(time.Now().Year())
 	case "xkcd-kelly":
 		str.WriteString("compromise between 1000 and 1024 bytes\n")
 		size = float64(sumBytes) / (1012 * 1012)
@@ -188,4 +187,15 @@ func isLeapYear(year int) bool {
 		}
 	}
 	return leapFlag
+}
+
+// xkcdKbDivisor returns the byte divisor the xkcd-kb unit divides total bytes
+// by to obtain megabytes: 1_000_000 (1000-based) during leap years and
+// 1_048_576 (1024-based) otherwise, matching the unit's help text "1000 bytes
+// during leap years, 1024 otherwise". Pure in year for year-independent tests.
+func xkcdKbDivisor(year int) float64 {
+	if isLeapYear(year) {
+		return 1_000_000
+	}
+	return 1_048_576
 }

@@ -5,7 +5,7 @@ package main
 import (
 	"testing"
 
-	"github.com/boyter/scc/v3/processor"
+	"github.com/boyter/scc/v4/processor"
 )
 
 func TestFilterMatchLocations_OnlyCode_KeepsCodeMatches(t *testing.T) {

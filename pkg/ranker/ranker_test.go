@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/boyter/cs/v3/pkg/common"
-	"github.com/boyter/scc/v3/processor"
+	"github.com/boyter/scc/v4/processor"
 )
 
 // --- matchWeight tests ---

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/boyter/gocodewalker"
-	"github.com/go-git/go-git/v5"
 )
 
 // DefaultReportName is the file name used when --report is invoked without
@@ -414,11 +413,11 @@ func CollectReportData(path string) (ReportData, error) {
 }
 
 // detectGit returns true if the path (or any parent) contains a git working
-// directory. Uses go-git's PlainOpenWithOptions with DetectDotGit so callers
-// can pass a subdirectory of a repo. Cached behaviour is not needed here —
-// this is called once at the start of CollectReportData.
+// directory. Goes through openRepository so callers can pass a subdirectory of
+// a repo, or a linked worktree. Cached behaviour is not needed here — this is
+// called once at the start of CollectReportData.
 func detectGit(path string) bool {
-	_, err := git.PlainOpenWithOptions(path, &git.PlainOpenOptions{DetectDotGit: true})
+	_, err := openRepository(path)
 	return err == nil
 }
 
@@ -495,12 +494,13 @@ func walkAndAggregate(path string) ([]*FileJob, []LanguageSummary, Totals, error
 
 	ctx := processorContext{remap: newRemapConfig(RemapAll, RemapUnknown)}
 
-	potentialFilesQueue := make(chan *gocodewalker.File, FileListQueueSize)
+	potentialFilesQueue := make(chan []*gocodewalker.File, FileListQueueSize)
 	fileListQueue := make(chan *FileJob, FileListQueueSize)
 	fileSummaryJobQueue := make(chan *FileJob, FileSummaryJobQueueSize)
 
 	if len(dirPaths) > 0 {
-		fileWalker := gocodewalker.NewParallelFileWalker(dirPaths, potentialFilesQueue)
+		fileWalker := gocodewalker.NewParallelFileWalker(dirPaths, nil)
+		fileWalker.SetFileBatchQueue(potentialFilesQueue)
 		fileWalker.SetErrorHandler(func(e error) bool {
 			printError(e.Error())
 			return true
@@ -534,43 +534,12 @@ func walkAndAggregate(path string) ([]*FileJob, []LanguageSummary, Totals, error
 			}
 		}()
 
-		go func() {
-			for fi := range potentialFilesQueue {
-				shouldExclude := false
-				for _, re := range excludePathRegexes {
-					if re.MatchString(fi.Location) {
-						shouldExclude = true
-						break
-					}
-				}
-				if shouldExclude {
-					continue
-				}
-				fileInfo, err := os.Lstat(fi.Location)
-				if err != nil {
-					continue
-				}
-				if !fileInfo.IsDir() {
-					if job := newFileJob(fi.Location, fi.Filename, fileInfo); job != nil {
-						fileListQueue <- job
-					}
-				}
-			}
-			close(fileListQueue)
-		}()
+		// filePaths are deliberately not passed here: the report path has never
+		// counted loose files alongside directories and picking them up now would
+		// change its output.
+		startFileJobProducer(potentialFilesQueue, nil, excludePathRegexes, fileListQueue)
 	} else {
-		go func() {
-			for _, f := range filePaths {
-				fileInfo, err := os.Lstat(f)
-				if err != nil {
-					continue
-				}
-				if job := newFileJob(f, f, fileInfo); job != nil {
-					fileListQueue <- job
-				}
-			}
-			close(fileListQueue)
-		}()
+		startFileJobProducer(nil, filePaths, nil, fileListQueue)
 	}
 
 	go ctx.fileProcessorWorker(fileListQueue, fileSummaryJobQueue)

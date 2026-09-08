@@ -19,7 +19,7 @@ import (
 	"github.com/boyter/cs/v3/pkg/search"
 	"github.com/boyter/cs/v3/pkg/snippet"
 	"github.com/boyter/gocodewalker"
-	"github.com/boyter/scc/v3/processor"
+	"github.com/boyter/scc/v4/processor"
 )
 
 // SearchStats holds counters readable after the search channel drains.

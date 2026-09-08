@@ -29,6 +29,12 @@ const (
 	Ignore                = ".ignore"
 	GitModules            = ".gitmodules"
 	IgnoreBinaryFileBytes = 1000
+
+	// gitDirName is the entry that marks a repository root, either as a
+	// directory for a normal checkout or as a regular file for a worktree or
+	// submodule. Kept unexported because it is an implementation detail of
+	// finding $GIT_DIR/info/exclude rather than something callers configure.
+	gitDirName = ".git"
 )
 
 // ErrTerminateWalk error which indicates that the walker was terminated
@@ -68,6 +74,7 @@ var semaphoreCount = 8
 
 type FileWalker struct {
 	fileListQueue          chan<- *File
+	fileBatchQueue         chan<- []*File   // set by SetFileBatchQueue, takes precedence over fileListQueue
 	errorsHandler          func(error) bool // If returns true will continue to process where possible, otherwise returns if possible
 	skipHandler            func(path string, name string, isDir bool, reason SkipReason)
 	directory              string
@@ -98,6 +105,8 @@ type FileWalker struct {
 	IncludeHidden          bool     // Should hidden files and directories be included/walked
 	osOpen                 func(name string) (*os.File, error)
 	osReadFile             func(name string) ([]byte, error)
+	gitDirFromEnv          bool   // was $GIT_DIR set when this walk started
+	gitExcludeFromEnv      []byte // contents of $GIT_DIR/info/exclude, read once per walk
 	countingSemaphore      chan bool
 	semaphoreCount         int
 	MaxDepth               int
@@ -181,6 +190,28 @@ func NewParallelFileWalker(directories []string, fileListQueue chan<- *File) *Fi
 		IgnoreBinaryFiles:      false,
 		IgnoreBinaryFileBytes:  IgnoreBinaryFileBytes,
 	}
+}
+
+// SetFileBatchQueue switches the walker over to handing its results out one
+// directory at a time rather than one file at a time. When it is set the
+// supplied channel receives a slice of the files each directory yielded, and it
+// rather than the per file queue is the one closed when the walk finishes.
+//
+// This exists because the handover, not the walking, is what limits the walk.
+// Measured on the Linux kernel (90,000 files in 6,000 directories) the walking
+// goroutines spent 44% of their time blocked in the per file channel send at
+// the default concurrency, and 72% of it at a concurrency of 64 — which is why
+// raising the concurrency did not make the walk any faster, the extra
+// goroutines simply queued at the channel. The cost is per send rather than per
+// file, and does not come from the buffer being full: a queue 3,000 times
+// deeper did not change it. Handing over a directory at a time turns roughly
+// 90,000 sends into roughly 6,000.
+//
+// Must be called before Start. Passing nil restores the per file behaviour.
+func (f *FileWalker) SetFileBatchQueue(queue chan<- []*File) {
+	f.walkMutex.Lock()
+	defer f.walkMutex.Unlock()
+	f.fileBatchQueue = queue
 }
 
 // SetConcurrency sets the concurrency when walking
@@ -302,6 +333,11 @@ func (f *FileWalker) Start() error {
 	// done here because it should not change while walking
 	f.countingSemaphore = make(chan bool, concurrency)
 
+	// $GIT_DIR cannot change while walking, so it is read once here rather than
+	// once per directory, and when it is set the exclude file it names is read
+	// once here as well rather than re-read in every directory below.
+	f.readEnvGitExclude()
+
 	if len(f.directories) != 0 {
 		eg := errgroup.Group{}
 		for _, directory := range f.directories {
@@ -320,7 +356,7 @@ func (f *FileWalker) Start() error {
 				if gerr != nil {
 					return f.stop(gerr)
 				}
-				return f.walkDirectoryRecursive(0, d, globalIgnores, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
+				return f.walkDirectoryRecursive(0, d, absoluteWalkRoot(d), globalIgnores, f.rootGitIgnores(d), []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
 			})
 		}
 
@@ -332,7 +368,7 @@ func (f *FileWalker) Start() error {
 			if gerr != nil {
 				_ = f.stop(gerr)
 			} else {
-				_ = f.walkDirectoryRecursive(0, f.directory, globalIgnores, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
+				_ = f.walkDirectoryRecursive(0, f.directory, absoluteWalkRoot(f.directory), globalIgnores, f.rootGitIgnores(f.directory), []gitignore.GitIgnore{}, []gitignore.GitIgnore{}, []gitignore.GitIgnore{})
 			}
 			<-f.countingSemaphore
 		}
@@ -345,7 +381,11 @@ func (f *FileWalker) Start() error {
 	// has to be waited on here before the queue can be closed.
 	f.walkWg.Wait()
 
-	close(f.fileListQueue)
+	if f.fileBatchQueue != nil {
+		close(f.fileBatchQueue)
+	} else {
+		close(f.fileListQueue)
+	}
 
 	f.walkMutex.Lock()
 	f.isWalking = false
@@ -353,6 +393,113 @@ func (f *FileWalker) Start() error {
 	f.walkMutex.Unlock()
 
 	return err
+}
+
+// readEnvGitExclude reads $GIT_DIR once for the whole walk and, when it is set,
+// reads the exclude file it names once. Previously both happened in every
+// directory: the environment lookup was repeated for a value that cannot change
+// while walking, and the same absolute file was read again for each directory
+// and then anchored at that directory, so a root anchored pattern such as
+// /build applied at every level instead of only at the root. When $GIT_DIR is
+// set it names one git directory for the whole walk, so the file it holds is
+// read once here and anchored at each walk root by rootGitIgnores.
+func (f *FileWalker) readEnvGitExclude() {
+	f.gitDirFromEnv = false
+	f.gitExcludeFromEnv = nil
+
+	if f.IgnoreGitIgnore {
+		return
+	}
+
+	gitdir := os.Getenv("GIT_DIR")
+	if gitdir == "" {
+		return
+	}
+
+	// record that it was set even when the file is missing, because $GIT_DIR
+	// overrides looking for a .git entry while walking either way
+	f.gitDirFromEnv = true
+	if content, err := os.ReadFile(filepath.Join(gitdir, "info", "exclude")); err == nil {
+		f.gitExcludeFromEnv = content
+	}
+}
+
+// rootGitIgnores returns the seed gitignores for a walk root, which is the
+// exclude file named by $GIT_DIR anchored at that root when there is one, and
+// nothing otherwise.
+func (f *FileWalker) rootGitIgnores(directory string) []gitignore.GitIgnore {
+	if len(f.gitExcludeFromEnv) == 0 {
+		return []gitignore.GitIgnore{}
+	}
+
+	abs, err := filepath.Abs(directory)
+	if err != nil {
+		return []gitignore.GitIgnore{}
+	}
+
+	return []gitignore.GitIgnore{gitignore.New(bytes.NewReader(f.gitExcludeFromEnv), abs, nil)}
+}
+
+// gitInfoExcludePath returns the path of the info/exclude file belonging to the
+// .git entry found in a directory.
+//
+// A normal checkout has .git as a directory and the file simply sits inside it.
+// A submodule, or a checkout made by git worktree add, instead has .git as a
+// regular file holding a "gitdir: <path>" line naming the real git directory,
+// and for a worktree that directory holds a commondir file naming the shared
+// directory which owns info/ (see gitrepository-layout). Following both is what
+// lets a worktree honour the exclude file of the repository it belongs to, the
+// way git itself does.
+//
+// A symlinked .git also reports as not being a directory, and reading it as a
+// file fails, so anything that does not parse falls back to joining onto the
+// entry as before, which resolves the link exactly as it always has.
+func gitInfoExcludePath(directory string, entry fs.DirEntry) string {
+	gitdir := filepath.Join(directory, gitDirName)
+
+	if !entry.IsDir() {
+		if resolved := resolveGitDirFile(directory, gitdir); resolved != "" {
+			gitdir = resolved
+		}
+	}
+
+	return filepath.Join(gitdir, "info", "exclude")
+}
+
+// resolveGitDirFile reads a .git file and returns the git directory that owns
+// info/, or an empty string if the file is not a readable "gitdir:" pointer.
+func resolveGitDirFile(directory string, gitFile string) string {
+	content, err := os.ReadFile(gitFile)
+	if err != nil {
+		return ""
+	}
+
+	line, _, _ := strings.Cut(string(content), "\n")
+	if !strings.HasPrefix(line, "gitdir:") {
+		return ""
+	}
+
+	gitdir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if gitdir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(directory, gitdir)
+	}
+
+	// a worktree git directory is per worktree, but info/ lives in the common
+	// directory it points at, which is the git directory of the main checkout
+	if content, err := os.ReadFile(filepath.Join(gitdir, "commondir")); err == nil {
+		if common := strings.TrimSpace(string(content)); common != "" {
+			if filepath.IsAbs(common) {
+				gitdir = common
+			} else {
+				gitdir = filepath.Join(gitdir, common)
+			}
+		}
+	}
+
+	return gitdir
 }
 
 // buildGlobalIgnores reads each path in CustomIgnoreFiles, parses it as gitignore
@@ -393,8 +540,35 @@ func (f *FileWalker) buildGlobalIgnores(directory string) ([]gitignore.GitIgnore
 	return globalIgnores, nil
 }
 
+// absoluteWalkRoot resolves a walk root to slash separated absolute form, once,
+// so that every path tested against an ignore file below it can be built by
+// concatenation rather than resolved individually.
+//
+// Matching needs an absolute path because an ignore file's base is absolute.
+// Resolving one per path meant a filepath.Abs per file per ignore file in
+// scope, which is a working directory lookup and a Clean apiece, and the cache
+// that existed to blunt that cost a map lookup and a retained entry for every
+// path walked. A root resolved once and extended by concatenation gives the
+// same answer for free.
+//
+// A root that cannot be resolved is returned unchanged, which leaves the walk
+// passing the relative path it always did and MatchIsDir resolving it the old
+// way, so a failure here costs speed rather than correctness.
+func absoluteWalkRoot(directory string) string {
+	abs, err := filepath.Abs(directory)
+	if err != nil {
+		return directory
+	}
+
+	// A trailing separator would make the concatenation below produce "//name".
+	// Abs only leaves one on a volume root, "/" or "C:\\", so this trims exactly
+	// that case and turns it into the empty prefix the concatenation wants.
+	return strings.TrimSuffix(filepath.ToSlash(abs), "/")
+}
+
 func (f *FileWalker) walkDirectoryRecursive(iteration int,
 	directory string,
+	absDirectory string,
 	globalIgnores []gitignore.GitIgnore,
 	gitignores []gitignore.GitIgnore,
 	ignores []gitignore.GitIgnore,
@@ -441,11 +615,20 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 
 	files := []fs.DirEntry{}
 	dirs := []fs.DirEntry{}
+	// the .git entry if this directory has one, which marks it as a repository
+	// root and is the only place an info/exclude file can be found. It is picked
+	// up here because the listing is already in hand, so no extra syscall is
+	// needed to know whether looking for that file is worth it at all
+	var gitEntry fs.DirEntry
 
 	// We want to break apart the files and directories from the
 	// return as we loop over them differently and this avoids some
 	// nested if logic at the expense of a "redundant" loop
 	for _, file := range foundFiles {
+		if file.Name() == gitDirName {
+			gitEntry = file
+		}
+
 		if file.IsDir() {
 			dirs = append(dirs, file)
 		} else {
@@ -559,13 +742,15 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 			}
 		}
 	}
-	if !f.IgnoreGitIgnore {
-		gitdir := os.Getenv("GIT_DIR")
-		if gitdir == "" {
-			gitdir = filepath.Join(directory, ".git")
-		}
-		file := filepath.Join(gitdir, "info", "exclude")
-		if content, err := os.ReadFile(file); err == nil {
+	// info/exclude only exists at a repository root, so blindly trying to read it
+	// in every directory was one guaranteed failed open per directory on any large
+	// tree, 6,052 of 6,053 of them on the linux kernel. The directory listing is
+	// already in hand and already tells us whether this is a repository root, the
+	// same way .gitignore is found above, so only look when there is a .git entry
+	// to look inside. When $GIT_DIR is set it overrides the .git entry entirely,
+	// as it always has, and has already been read once by readEnvGitExclude.
+	if !f.IgnoreGitIgnore && !f.gitDirFromEnv && gitEntry != nil {
+		if content, err := os.ReadFile(gitInfoExcludePath(directory, gitEntry)); err == nil {
 			abs, err := filepath.Abs(directory)
 			if err == nil {
 				gitExclude := gitignore.New(bytes.NewReader(content), abs, nil)
@@ -591,17 +776,26 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 		customIgnores = append(customIgnores, gitIgnore)
 	}
 
+	// When a batch queue is in use the files this directory yields are collected
+	// here and handed over in one channel operation at the end of the loop. See
+	// SetFileBatchQueue for why that matters.
+	var batch []*File
+
 	// Process files first to start feeding whatever process is consuming
 	// the output before traversing into directories for more files
 	for _, file := range files {
 		shouldIgnore := false
 		var skipReason SkipReason
 		joined := filepath.ToSlash(filepath.Join(directory, file.Name()))
+		matchPath := joined
+		if absDirectory != directory {
+			matchPath = absDirectory + "/" + file.Name()
+		}
 
 		// Global ignore files supplied by path are the lowest priority, so they
 		// are checked first and anything discovered while walking can override them
 		for _, ignore := range globalIgnores {
-			if m := ignore.MatchIsDir(joined, false); m != nil {
+			if m := ignore.MatchIsDir(matchPath, false); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonGlobalIgnore
@@ -617,7 +811,7 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 			// 2. one or more match
 			// for #1 this means we should include the file
 			// for #2 this means the last one wins since it should be the most correct
-			if m := ignore.MatchIsDir(joined, false); m != nil {
+			if m := ignore.MatchIsDir(matchPath, false); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonGitignore
@@ -629,7 +823,7 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 
 		for _, ignore := range ignores {
 			// same rules as above
-			if m := ignore.MatchIsDir(joined, false); m != nil {
+			if m := ignore.MatchIsDir(matchPath, false); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonIgnoreFile
@@ -641,7 +835,7 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 
 		for _, ignore := range customIgnores {
 			// same rules as above
-			if m := ignore.MatchIsDir(joined, false); m != nil {
+			if m := ignore.MatchIsDir(matchPath, false); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonCustomIgnore
@@ -772,11 +966,29 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 		if shouldIgnore {
 			f.skipHandler(joined, file.Name(), false, skipReason)
 		} else {
-			f.fileListQueue <- &File{
-				Location: joined,
-				Filename: file.Name(),
+			if f.fileBatchQueue != nil {
+				if batch == nil {
+					// one backing array for the whole directory, since the
+					// number of files that survive the filters above is usually
+					// close to the number of entries it holds
+					batch = make([]*File, 0, len(files))
+				}
+				batch = append(batch, &File{
+					Location: joined,
+					Filename: file.Name(),
+				})
+			} else {
+				f.fileListQueue <- &File{
+					Location: joined,
+					Filename: file.Name(),
+				}
 			}
 		}
+	}
+
+	// hand this directory's files over in a single channel operation
+	if len(batch) != 0 {
+		f.fileBatchQueue <- batch
 	}
 
 	// The ignore slices are about to be handed to subdirectories, which each
@@ -798,13 +1010,17 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 		var shouldIgnore bool
 		var skipReason SkipReason
 		joined := filepath.ToSlash(filepath.Join(directory, dir.Name()))
+		matchPath := joined
+		if absDirectory != directory {
+			matchPath = absDirectory + "/" + dir.Name()
+		}
 
 		// Check against the ignore files we have if the file we are looking at
 		// should be ignored
 		// It is safe to always call this because the gitignores will not be added
 		// in previous steps
 		for _, ignore := range globalIgnores {
-			if m := ignore.MatchIsDir(joined, true); m != nil {
+			if m := ignore.MatchIsDir(matchPath, true); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonGlobalIgnore
@@ -819,7 +1035,7 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 			// 2. one or more match
 			// for #1 this means we should include the file
 			// for #2 this means the last one wins since it should be the most correct
-			if m := ignore.MatchIsDir(joined, true); m != nil {
+			if m := ignore.MatchIsDir(matchPath, true); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonGitignore
@@ -830,7 +1046,7 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 		}
 		for _, ignore := range ignores {
 			// same rules as above
-			if m := ignore.MatchIsDir(joined, true); m != nil {
+			if m := ignore.MatchIsDir(matchPath, true); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonIgnoreFile
@@ -841,7 +1057,7 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 		}
 		for _, ignore := range customIgnores {
 			// same rules as above
-			if m := ignore.MatchIsDir(joined, true); m != nil {
+			if m := ignore.MatchIsDir(matchPath, true); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonCustomIgnore
@@ -852,7 +1068,7 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 		}
 		for _, ignore := range moduleIgnores {
 			// same rules as above
-			if m := ignore.MatchIsDir(joined, true); m != nil {
+			if m := ignore.MatchIsDir(matchPath, true); m != nil {
 				shouldIgnore = m.Ignore()
 				if shouldIgnore {
 					skipReason = SkipReasonModuleIgnore
@@ -944,15 +1160,15 @@ func (f *FileWalker) walkDirectoryRecursive(iteration int,
 			select {
 			case f.countingSemaphore <- true:
 				f.walkWg.Add(1)
-				go func(joined string, gitignores, ignores, moduleIgnores, customIgnores []gitignore.GitIgnore) {
+				go func(joined, matchPath string, gitignores, ignores, moduleIgnores, customIgnores []gitignore.GitIgnore) {
 					defer f.walkWg.Done()
 					defer func() { <-f.countingSemaphore }()
 					// the error is recorded by stop rather than returned, since
 					// there is nowhere to return it to from here
-					_ = f.walkDirectoryRecursive(iteration+1, joined, globalIgnores, gitignores, ignores, moduleIgnores, customIgnores)
-				}(joined, gitignores, ignores, moduleIgnores, customIgnores)
+					_ = f.walkDirectoryRecursive(iteration+1, joined, matchPath, globalIgnores, gitignores, ignores, moduleIgnores, customIgnores)
+				}(joined, matchPath, gitignores, ignores, moduleIgnores, customIgnores)
 			default:
-				if err := f.walkDirectoryRecursive(iteration+1, joined, globalIgnores, gitignores, ignores, moduleIgnores, customIgnores); err != nil {
+				if err := f.walkDirectoryRecursive(iteration+1, joined, matchPath, globalIgnores, gitignores, ignores, moduleIgnores, customIgnores); err != nil {
 					return err
 				}
 			}

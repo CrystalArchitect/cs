@@ -5,7 +5,7 @@ package main
 import (
 	"strings"
 
-	"github.com/boyter/scc/v3/processor"
+	"github.com/boyter/scc/v4/processor"
 )
 
 // initLanguageDatabase initialises the scc language database.
