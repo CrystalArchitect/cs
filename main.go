@@ -12,7 +12,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const Version = "3.1.0"
+const Version = "3.2.0"
 
 func main() {
 	cfg := DefaultConfig()
