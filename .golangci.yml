@@ -1,0 +1,67 @@
+# Go linting configuration for golangci-lint (ADM-001)
+# Compatible with golangci-lint v1.59.0+
+
+run:
+  timeout: 5m
+  skip-dirs:
+    - vendor/
+    - .git/
+    - node_modules/
+  skip-files:
+    - ".*_test.go"
+    - ".*_mock.go"
+
+linters:
+  enable:
+    # Essential Go linters
+    - errcheck       # Check for unchecked errors
+    - gosimple       # Simplification suggestions
+    - govet          # Go vet wrapper
+    - ineffassign    # Ineffective assignments
+    - staticcheck    # Advanced static analysis
+    - typecheck      # Type checking
+    - unused         # Unused code detection
+
+    # Code style & conventions
+    - gofmt          # Go formatting
+    - goimports      # Automatic import organization
+    - misspell       # Spelling mistakes
+
+    # Security & best practices
+    - gosec          # Security issues
+    - nolintlint     # Validate nolint directives
+
+  disable:
+    - deadcode       # Deprecated; replaced by unused
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+  govet:
+    check-shadow: true
+    enable-all: true
+
+  staticcheck:
+    checks:
+      - all
+
+  gosimple:
+    go: "1.25"
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
+issues:
+  exclude-rules:
+    # Allow main() without error checking
+    - path: cmd/.*
+      linters:
+        - errcheck
+    # Ignore false positives in test files
+    - path: ".*_test.go"
+      linters:
+        - errcheck
